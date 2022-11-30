@@ -1,0 +1,3 @@
+*.tar
+.idea/
+notebooks/.ipynb_checkpoints
