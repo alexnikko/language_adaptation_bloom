@@ -12,7 +12,8 @@ from tqdm.auto import tqdm
 from functools import partial
 from collections import defaultdict
 
-from shutil import copyfile
+import os
+from shutil import copyfile, rmtree
 
 
 def build_tokenizer():
@@ -42,21 +43,19 @@ def main():
     model = build_model()
 
     num_workers = 4
-    batch_size = 16
-    n_steps_per_epoch = 10_000
+    batch_size = 48
+    n_steps_per_epoch = 1024 # 10_000
     seed, buffer_size = 42, 1024
     dataset = load_dataset('oscar', "unshuffled_deduplicated_ru", split='train', streaming=True)
     dataset = dataset.shuffle(seed, buffer_size=buffer_size)
     dataset = dataset.with_format("torch")
     dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers,
-                            collate_fn=partial(collate_fn, tokenizer=tokenizer))
-
-    # print(next(iter(dataloader)))
-    # print(next(iter(dataloader))['input_ids'].shape)
+                            collate_fn=partial(collate_fn, tokenizer=tokenizer), pin_memory=True)
 
     freeze_model(model)
     model.transformer.word_embeddings = torch.nn.Embedding(tokenizer.vocab_size + 1, 1024)
     model.transformer.word_embeddings_layernorm = torch.nn.LayerNorm([1024], eps=1e-5, elementwise_affine=True)
+    model.lm_head = torch.nn.Linear(1024, tokenizer.vocab_size + 1, bias=False)
 
     device = 'cuda:0'
 
@@ -65,15 +64,47 @@ def main():
 
     n_epochs = 300
     history = defaultdict(list)
+
+    # # try to overfit
+    # batch = next(iter(dataloader))
+    # batch = {key: value.to(device) for key, value in batch.items()}
+    # losses = []
+    # perplexity_values = []
+    # for _ in tqdm(range(100)):
+    #     outputs = model(**batch)
+    #     loss = outputs.loss
+    #     loss.backward()
+    #     optimizer.step()
+    #     optimizer.zero_grad()
+
+    #     losses.append(loss.item())
+    #     perplexity_values.append(torch.exp(loss).item())
+
+    #     print(f'Loss = {losses[-1]}')
+    #     print(f'Perplexity = {perplexity_values[-1]}')
+    # assert False
+
     start_epoch = 0
-    resume = True
+    # resume = True
+    resume = False
+    exp_name = 'lm_head_learnable'
+    savedir = os.path.join('train_results', exp_name)
+    if not resume and os.path.exists(savedir):
+        ans = input(f'Savedir = {savedir} exists. Do you want to rewrite it? Y/n: ').lower()
+        if ans == 'y':
+            rmtree(savedir)
+    os.makedirs(savedir)
+    last_snapshot_name = os.path.join(savedir, 'last_snapshot.tar')
     if resume:
-        snapshot = torch.load('last_snapshot.tar', map_location='cpu')
+        assert os.path.exists(last_snapshot_name)
+
+    if resume:
+        snapshot = torch.load(last_snapshot_name, map_location='cpu')
         model.load_state_dict(snapshot['model'])
         optimizer.load_state_dict(snapshot['optimizer'])
         history = snapshot['history']
         start_epoch = len(history['train_loss'])
-        copyfile('last_snapshot.tar', f'snapshot_epoch_{str(start_epoch).zfill(4)}.tar')
+        copyfile(last_snapshot_name, os.path.join(savedir, f'snapshot_epoch_{str(start_epoch).zfill(4)}.tar'))
     for epoch in tqdm(range(start_epoch, n_epochs)):
         dataset.set_epoch(epoch)
         losses = []
@@ -109,7 +140,8 @@ def main():
             'history': history
         }
 
-        path = 'last_snapshot.tar'
+        # path = 'last_snapshot.tar'
+        path = last_snapshot_name
         torch.save(snapshot, path)
 
         # losses = []
