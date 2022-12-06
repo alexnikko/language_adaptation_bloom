@@ -30,67 +30,83 @@ def freeze_model(model):
         p.requires_grad = False
 
 
+def collate_fn(data, tokenizer):
+    texts = [x['text'] for x in data]
+    inputs = tokenizer(texts, padding=True, return_tensors='pt', max_length=64, truncation=True)
+    inputs['labels'] = torch.where(inputs['input_ids'] == 50257, -100, inputs['input_ids'])
+    return inputs
+
+
+def get_pred_token(logits, greedy=False):
+    if greedy:
+        pred_token = logits.argmax()  # greedy decoding
+    else:
+        pred_token = np.random.choice(len(logits), p=torch.nn.functional.softmax(logits, dim=-1).numpy())  # sampling
+    return pred_token
+
+
 if __name__ == '__main__':
     tokenizer = build_tokenizer()
     model = build_model()
-    # print(model.transformer.word_embeddings)
-    model.transformer.word_embeddings = torch.nn.Embedding(tokenizer.vocab_size + 1, 1024)
-    model.transformer.word_embeddings_layernorm = torch.nn.LayerNorm([1024], eps=1e-5, elementwise_affine=True)
-    snapshot = torch.load('last_snapshot.tar', map_location='cpu')
-    model.load_state_dict(snapshot['model'])
+
+    # original = False
+    original = True
+    if not original:
+        model.transformer.word_embeddings = torch.nn.Embedding(tokenizer.vocab_size + 1, 1024)
+        model.transformer.word_embeddings_layernorm = torch.nn.LayerNorm([1024], eps=1e-5, elementwise_affine=True)
+        model.lm_head = torch.nn.Linear(1024, tokenizer.vocab_size + 1, bias=False)
+        snapshot = torch.load('train_results/lm_head_learnable/last_snapshot.tar', map_location='cpu')
+        model.load_state_dict(snapshot['model'])
     freeze_model(model)
     model.eval()
+
+    print(f'Bloom model with original weights = {original} has been loaded.')
     
+
     text_promt = 'Меня зовут Анна. Я работаю учителем в школе. Сегодня на уроке'
     inputs = tokenizer(text_promt, padding=True, return_tensors='pt', max_length=64, truncation=True)
-    tokens = inputs['input_ids'][0]
-    for token in tokens:
-        token = token.item()
-        print(token, tokenizer.decode(token))
-    outputs = model(**inputs)
-    logits = outputs.logits
-    print(tokenizer.vocab_size)
-    print(logits.shape)
-    print(logits.argmax())
-    logits = logits[0, -1, :tokenizer.vocab_size + 1]
-    print(logits.shape)
-    pred_token = logits.argmax()
-    print(pred_token)
-    print(tokenizer.decode(pred_token.item()))
-    print(tokenizer.decode(9140))
-
-
-    print(inputs.keys())
-    print(inputs['input_ids'].shape)
-    print(inputs['input_ids'])
-
-    # print(pred_token)
-    # print(type(pred_token))
-    # print(pred_token.unsqueeze(0).unsqueeze(0))
-    pred_token = pred_token.unsqueeze(0).unsqueeze(0)
-
-    print(torch.cat([inputs['input_ids'], pred_token], dim=1))
-    print(tokenizer.decode(tokens))
-    # print(torch.cat([input['input_ids'], torch.LongTensor(pred_token.item())], dim=1))
-    # print(torch.cat([inputs['input_ids'], torch.LongTensor([[pred_token.item]]), dim=1))
-    # print(type(outputs))
-    # print(text_tokens)
-    print(inputs['attention_mask'])
-    print(inputs['attention_mask'].shape)
-    print(torch.LongTensor([[1]]))
-    import numpy as np
-    for i in range(10):
+    n_tokens_to_generate = 10
+    for i in tqdm(range(n_tokens_to_generate)):
         outputs = model(**inputs)
         logits = outputs.logits
-        logits = logits[0, -1, :tokenizer.vocab_size + 1]
-        # pred_token = logits.argmax()
-        print(torch.nn.functional.softmax(logits).sum())
-        pred_token = np.random.choice(len(logits), p=torch.nn.functional.softmax(logits).numpy())
-        # pred_token = pred_token.unsqueeze(0).unsqueeze(0)
+        logits = logits[0, -1]
 
+        pred_token = get_pred_token(logits)
 
         inputs['input_ids'] = torch.cat([inputs['input_ids'], torch.LongTensor([[pred_token]])], dim=1)
         inputs['attention_mask'] = torch.cat([inputs['attention_mask'], torch.LongTensor([[1]])], dim=1)
 
-    tokens = tokens = inputs['input_ids'][0]
+    tokens = inputs['input_ids'][0]
     print(tokenizer.decode(tokens))
+
+    # evaluation
+    num_workers = 4
+    batch_size = 16
+    n_steps_per_epoch = 1024
+    seed, buffer_size = 111, 1024
+    dataset = load_dataset('oscar', "unshuffled_deduplicated_ru", split='train', streaming=True)
+    dataset = dataset.shuffle(seed, buffer_size=buffer_size)
+    dataset = dataset.with_format("torch")
+    dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers,
+                            collate_fn=partial(collate_fn, tokenizer=tokenizer), pin_memory=True)
+    history = defaultdict(list)
+    losses = []
+    perplexity_values = []
+    device = 'cuda:0'
+    model.to(device)
+    for i, batch in tqdm(enumerate(dataloader, start=1), total=n_steps_per_epoch):
+        batch = {key: value.to(device) for key, value in batch.items()}
+        outputs = model(**batch)
+
+        loss = outputs.loss
+
+        losses.append(loss.item())
+        perplexity_values.append(torch.exp(loss).item())
+
+        if i == n_steps_per_epoch:
+            break
+
+    print()
+    print(f'Val loss = {np.mean(losses)}')
+    print(f'Val perplexity = {np.mean(perplexity_values)}')
+    print()

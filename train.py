@@ -85,15 +85,15 @@ def main():
     # assert False
 
     start_epoch = 0
-    # resume = True
-    resume = False
+    resume = True
+    # resume = False
     exp_name = 'lm_head_learnable'
     savedir = os.path.join('train_results', exp_name)
     if not resume and os.path.exists(savedir):
         ans = input(f'Savedir = {savedir} exists. Do you want to rewrite it? Y/n: ').lower()
         if ans == 'y':
             rmtree(savedir)
-    os.makedirs(savedir)
+        os.makedirs(savedir)
     last_snapshot_name = os.path.join(savedir, 'last_snapshot.tar')
     if resume:
         assert os.path.exists(last_snapshot_name)
