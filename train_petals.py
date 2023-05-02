@@ -3,7 +3,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, random_split
 
-from transformers import BloomTokenizerFast, BloomForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
+from transformers import BloomTokenizerFast, BloomForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling, \
+    get_scheduler
 
 from datasets import load_dataset
 
@@ -16,6 +17,8 @@ import os
 from shutil import copyfile, rmtree
 
 import argparse
+
+from petals import DistributedBloomForCausalLM
 
 
 def build_tokenizer(padding_side='right', truncation_side='right'):
@@ -36,14 +39,27 @@ def build_tokenizer(padding_side='right', truncation_side='right'):
     return tokenizer
 
 
-def build_model(n_tokens, pretrained_model_name_or_path='bigscience/bloom-560m'):
-    model = BloomForCausalLM.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path)
+def build_model(n_tokens, pretrained_model_name_or_path='bigscience/bloom-7b1-petals'):
+    # model = BloomForCausalLM.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path)
+    model = DistributedBloomForCausalLM.from_pretrained(pretrained_model_name_or_path)
+    hidden_size = 4096
+    if pretrained_model_name_or_path in ['bigscience/bloom-petals', 'bigscience/bloomz-petals']:
+        hidden_size = 14336
     print_desc(model)
-    freeze_model(model)
-    model.transformer.word_embeddings = torch.nn.Embedding(n_tokens, 1024)
-    model.lm_head = torch.nn.Linear(1024, n_tokens, bias=False)
+    # print(model.transformer.word_embeddings.weight)
+    print(model)
+    # assert False
+    # freeze_model(model)
+    model.transformer.word_embeddings = torch.nn.Embedding(n_tokens, hidden_size)
+    # model.transformer.word_embeddings.weight = torch.nn.Parameter(
+    #     # model.transformer.word_embeddings.weight.data.bfloat16(),
+    #     model.transformer.word_embeddings.weight.data.half(),
+    #     requires_grad=True
+    # )
+    model.lm_head = torch.nn.Linear(hidden_size, n_tokens, bias=False)
     model.lm_head.weight = model.transformer.word_embeddings.weight
     print_desc(model)
+    # assert False
     return model
 
 
@@ -64,19 +80,20 @@ def print_desc(model):
     )
 
 
-def collate_fn(data, tokenizer):
+def collate_fn(data, tokenizer, max_length=256):
     texts = [x['text'] for x in data]
-    inputs = tokenizer(texts, padding='max_length', return_tensors='pt', max_length=256, truncation=True)
+    inputs = tokenizer(texts, padding='max_length', return_tensors='pt', max_length=max_length, truncation=True)
     inputs['labels'] = torch.where(torch.eq(inputs['input_ids'], tokenizer.pad_token_id), -100, inputs['input_ids'])
     return inputs
 
 
-def build_data(tokenizer, batch_size=8, num_workers=4, seed=42, buffer_size=1024):
-    dataset = load_dataset('oscar', "unshuffled_deduplicated_ru", split='train', streaming=True)
+def build_data(tokenizer, max_length=256, batch_size=8, num_workers=4, seed=42, buffer_size=1024):
+    dataset = load_dataset('oscar', 'unshuffled_deduplicated_ru', split='train', streaming=True)
     dataset = dataset.shuffle(seed, buffer_size=buffer_size)
-    dataset = dataset.with_format("torch")
+    dataset = dataset.with_format('torch')
     dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers,
-                            collate_fn=partial(collate_fn, tokenizer=tokenizer), pin_memory=True)
+                            collate_fn=partial(collate_fn, tokenizer=tokenizer, max_length=max_length),
+                            pin_memory=True)
     return dataloader
 
 
@@ -85,9 +102,10 @@ def main():
     parser.add_argument('--resume', help='resume training from last checkpoint', action='store_true')
     args = parser.parse_args()
 
-
     tokenizer = build_tokenizer()
-    model = build_model(n_tokens=tokenizer.vocab_size + 1)  # vocab + pad
+    # model_name = 'bigscience/bloom-petals'
+    model_name = 'bigscience/bloom-7b1-petals'
+    model = build_model(n_tokens=tokenizer.vocab_size + 1, pretrained_model_name_or_path=model_name)  # vocab + pad
 
     # text = 'Привет, как дела?'
 
@@ -114,40 +132,64 @@ def main():
 
     # print(model.__dict__)
 
-    n_steps_per_epoch = 1024
-    dataloader = build_data(tokenizer)
+    n_epochs = 300
+    n_steps_per_epoch = 128
+    batch_size = 32
+    max_length = 16
+    dataloader = build_data(tokenizer, batch_size=batch_size, max_length=max_length)
 
     device = 'cuda:0'
+    learning_rate = 1e-2
+    weight_decay = 0.0
 
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    lr_scheduler = get_scheduler(name='linear', optimizer=optimizer, num_warmup_steps=n_steps_per_epoch,
+                                 num_training_steps=n_steps_per_epoch * n_epochs)
+    scaler = torch.cuda.amp.GradScaler()
 
-    n_epochs = 300
     history = defaultdict(list)
 
-    # try to overfit
+    # # try to overfit
     # batch = next(iter(dataloader))
     # batch = {key: value.to(device) for key, value in batch.items()}
+    # batch['attention_mask'] = None
     # losses = []
     # perplexity_values = []
     # for _ in tqdm(range(10_000)):
-    #     outputs = model(**batch)
-    #     loss = outputs.loss
-    #     loss.backward()
-    #     optimizer.step()
+    #     cur_lr = optimizer.param_groups[0]['lr']
+    #     with torch.autocast(device_type='cuda', dtype=torch.float16):
+    #         outputs = model(**batch)
+    #         loss = outputs.loss
+    #         # loss = loss_fn(output, target)
+    #     # with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+    #     #     outputs = model(**batch)
+    #     # loss = model(data)
+    #     # outputs = model(**batch)
+    #     # loss = outputs.loss
+    #     # loss.backward()
+    #     scaler.scale(loss).backward()
+    #     scaler.unscale_(optimizer)
+    #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
+    #     # optimizer.step()
+    #     scaler.step(optimizer)
     #     optimizer.zero_grad()
+    #     scaler.update()
+    #     lr_scheduler.step()
     #
     #     losses.append(loss.item())
     #     perplexity_values.append(torch.exp(loss).item())
     #
     #     print(f'Loss = {losses[-1]}')
     #     print(f'Perplexity = {perplexity_values[-1]}')
+    #     print(f'Lr = {cur_lr}')
     # assert False
 
     start_epoch = 0
     # resume = True
     # resume = False
-    exp_name = 'test_exp_0'
+    exp_name = 'test_exp_petals_0'
     savedir = os.path.join('train_results', exp_name)
     last_snapshot_name = os.path.join(savedir, 'last_snapshot.tar')
     if not args.resume:
@@ -173,19 +215,29 @@ def main():
         dataloader.dataset.set_epoch(epoch)
         losses = []
         perplexity_values = []
+        lrs = []
         model.train()
         for i, batch in tqdm(enumerate(dataloader, start=1), total=n_steps_per_epoch):
             optimizer.zero_grad()
+            lr_scheduler.step()
+            cur_lr = optimizer.param_groups[0]['lr']
 
-            batch = {key: value.to(device) for key, value in batch.items()}
-            outputs = model(**batch)
-
-            loss = outputs.loss
-            loss.backward()
-            optimizer.step()
+            batch['attention_mask'] = None
+            batch = {key: value.to(device) for key, value in batch.items() if key != 'attention_mask'}
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                outputs = model(**batch)
+                loss = outputs.loss
+            # loss.backward()
+            # optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
+            scaler.step(optimizer)
+            scaler.update()
 
             losses.append(loss.item())
             perplexity_values.append(torch.exp(loss).item())
+            lrs.append(cur_lr)
 
             if i == n_steps_per_epoch:
                 break
@@ -193,13 +245,15 @@ def main():
         print()
         print(f'Train loss = {np.mean(losses)}')
         print(f'Train perplexity = {np.mean(perplexity_values)}')
+        print(f'Current learning rate = {lrs[-1]}')
         print()
 
         history['train_loss'].append(np.mean(losses))
         history['train_perplexity'].append(np.mean(perplexity_values))
+        history['lr'].extend(lrs)
 
         snapshot = {
-            'model': model.state_dict(),
+            'model': model.transformer.word_embeddings.state_dict(),
             'optimizer': optimizer.state_dict(),
             'history': history
         }
