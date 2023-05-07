@@ -241,6 +241,5 @@ def main():
         path = last_snapshot_name
         torch.save(snapshot, path)
 
-
 if __name__ == '__main__':
     main()
