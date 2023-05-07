@@ -2,3 +2,5 @@
 .idea/
 notebooks/.ipynb_checkpoints
 train_results/
+*tmp.py
+__pycache__/
