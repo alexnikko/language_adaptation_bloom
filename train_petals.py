@@ -40,9 +40,13 @@ def build_tokenizer(padding_side='right', truncation_side='right'):
     return tokenizer
 
 
-def build_model(n_tokens, pretrained_model_name_or_path='bigscience/bloom-7b1-petals'):
+def build_model(n_tokens, pretrained_model_name_or_path='bigscience/bloom-7b1-petals', tied_weights=True):
     # model = BloomForCausalLM.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path)
-    model = DistributedBloomForCausalLM.from_pretrained(pretrained_model_name_or_path)
+    allowed_servers = [
+        '12D3KooWFAUdXwMTopuFbf49mruLrexj8kNJfkoFRPFSdT3bMqrp',
+        '12D3KooWHXR28A8No5opugegT5VAapPEFw1ZVCn9ipYiFxxLdxjv'
+    ]
+    model = DistributedBloomForCausalLM.from_pretrained(pretrained_model_name_or_path, allowed_servers=allowed_servers)
     hidden_size = 4096
     if pretrained_model_name_or_path in ['bigscience/bloom-petals', 'bigscience/bloomz-petals']:
         hidden_size = 14336
@@ -58,7 +62,8 @@ def build_model(n_tokens, pretrained_model_name_or_path='bigscience/bloom-7b1-pe
     #     requires_grad=True
     # )
     model.lm_head = torch.nn.Linear(hidden_size, n_tokens, bias=False)
-    model.lm_head.weight = model.transformer.word_embeddings.weight
+    if tied_weights:
+        model.lm_head.weight = model.transformer.word_embeddings.weight
     print_desc(model)
     # assert False
     return model
@@ -101,12 +106,14 @@ def build_data(tokenizer, max_length=256, batch_size=8, num_workers=4, seed=42, 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume', help='resume training from last checkpoint', action='store_true')
+    parser.add_argument('--not_tied', help='create lm head with its own trainable weight matrix', action='store_true')
     args = parser.parse_args()
+    args.tied = not args.not_tied
 
     tokenizer = build_tokenizer()
     # model_name = 'bigscience/bloom-petals'
     model_name = 'bigscience/bloom-7b1-petals'
-    model = build_model(n_tokens=tokenizer.vocab_size + 1, pretrained_model_name_or_path=model_name)  # vocab + pad
+    model = build_model(n_tokens=tokenizer.vocab_size + 1, pretrained_model_name_or_path=model_name, tied_weights=args.tied)  # vocab + pad
 
     n_epochs = 300
     n_steps_per_epoch = 32
@@ -167,7 +174,8 @@ def main():
     # assert False
 
     start_epoch = 0
-    exp_name = 'test_exp_petals_0'
+    # exp_name = 'test_exp_petals_0'
+    exp_name = 'test_exp_petals_7B1_not_tied'
     savedir = os.path.join('train_results', exp_name)
     last_snapshot_name = os.path.join(savedir, 'last_snapshot.tar')
     if not args.resume:
@@ -184,6 +192,8 @@ def main():
     if args.resume:
         snapshot = torch.load(last_snapshot_name, map_location='cpu')
         model.transformer.word_embeddings.load_state_dict(snapshot['model'])
+        if args.not_tied:
+            model.lm_head.load_state_dict(snapshot['lm_head'])
         # optimizer.load_state_dict(snapshot['optimizer'])
         history = snapshot['history']
         start_epoch = len(history['train_loss'])
@@ -238,6 +248,8 @@ def main():
             'optimizer': optimizer.state_dict(),
             'history': history
         }
+        if args.not_tied:
+            snapshot['lm_head'] = model.lm_head.state_dict()
         path = last_snapshot_name
         torch.save(snapshot, path)
 
