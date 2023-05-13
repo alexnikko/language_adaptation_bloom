@@ -21,6 +21,8 @@ import argparse
 
 from petals import DistributedBloomForCausalLM
 
+from termcolor import colored
+
 
 def build_tokenizer(padding_side='right', truncation_side='right'):
     tokenizer = AutoTokenizer.from_pretrained(
@@ -42,30 +44,33 @@ def build_tokenizer(padding_side='right', truncation_side='right'):
 
 def build_model(n_tokens, pretrained_model_name_or_path='bigscience/bloom-7b1-petals', tied_weights=True):
     # model = BloomForCausalLM.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path)
-    allowed_servers = [
-        '12D3KooWFAUdXwMTopuFbf49mruLrexj8kNJfkoFRPFSdT3bMqrp',
-        '12D3KooWHXR28A8No5opugegT5VAapPEFw1ZVCn9ipYiFxxLdxjv'
-    ]
-    model = DistributedBloomForCausalLM.from_pretrained(pretrained_model_name_or_path, allowed_servers=allowed_servers)
+    # allowed_servers = [
+    #    '12D3KooWG1kUacmYwvAwMSvbunDc1G6BBdQqhueqGa3r49kKQWg9',
+    #    '12D3KooWPB7ExVxsAeyfh2fCW8Z8anFZ3NnF9cMMgoF14giziobf'
+    # ]
+    allowed_servers = ['12D3KooWEawWeRy4sD31VnYhMKh3Gqr5Bj3LjLLZwZUaynGgipAT']
+    # allowed_servers = ['12D3KooWKBFvrQ7e5MA5aWBMURe4XLQXYYcenjUHCN9Mx6brRKJw']
+    pre_seq_len = 16
+    tuning_mode = 'ptune'
+    model = DistributedBloomForCausalLM.from_pretrained(
+        pretrained_model_name_or_path,
+        pre_seq_len=pre_seq_len,
+        tuning_mode=tuning_mode,
+        allowed_servers=allowed_servers,
+    )  # , allowed_servers=allowed_servers)
     hidden_size = 4096
     if pretrained_model_name_or_path in ['bigscience/bloom-petals', 'bigscience/bloomz-petals']:
         hidden_size = 14336
-    print_desc(model)
-    # print(model.transformer.word_embeddings.weight)
-    print(model)
-    # assert False
-    # freeze_model(model)
+
     model.transformer.word_embeddings = torch.nn.Embedding(n_tokens, hidden_size)
-    # model.transformer.word_embeddings.weight = torch.nn.Parameter(
-    #     # model.transformer.word_embeddings.weight.data.bfloat16(),
-    #     model.transformer.word_embeddings.weight.data.half(),
-    #     requires_grad=True
-    # )
     model.lm_head = torch.nn.Linear(hidden_size, n_tokens, bias=False)
     if tied_weights:
         model.lm_head.weight = model.transformer.word_embeddings.weight
+    model.transformer.word_embeddings_layernorm = torch.nn.LayerNorm(hidden_size)
+    model.transformer.ln_f = torch.nn.LayerNorm(hidden_size)
+
+    unfreeze_model(model)
     print_desc(model)
-    # assert False
     return model
 
 
@@ -74,7 +79,13 @@ def freeze_model(model):
         p.requires_grad = False
 
 
+def unfreeze_model(model):
+    for p in model.parameters():
+        p.requires_grad = True
+
+
 def print_desc(model):
+    print(model)
     n_params = sum(p.numel() for p in model.parameters())
     n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
@@ -84,6 +95,16 @@ def print_desc(model):
     Percentage of trainable parameters = {n_trainable_params / n_params * 100:.2f}%
     '''
     )
+
+    req_grad_dict = {name: param.requires_grad for name, param in model.named_parameters()}
+    for key, value in model.state_dict().items():
+        color = 'green' if req_grad_dict[key] else 'red'
+        print(f'''{colored(key, color)}
+                            shape: {colored(value.shape, attrs=['bold'])}
+                            num_params: {colored(str(value.numel() / 10 ** 6) + ' M', attrs=['bold'])}
+                            size: {colored(str(value.numel() * value.element_size() / 2 ** 20) + ' MB', attrs=['bold'])}
+                            dtype: {colored(value.dtype, attrs=['bold'])}
+                            requires_grad = {colored(req_grad_dict[key], attrs=['bold'])}''')
 
 
 def collate_fn(data, tokenizer, max_length=256):
@@ -107,33 +128,44 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume', help='resume training from last checkpoint', action='store_true')
     parser.add_argument('--not_tied', help='create lm head with its own trainable weight matrix', action='store_true')
+    parser.add_argument('--big', help='use bloom-176B', action='store_true')
+    parser.add_argument('--exp_name', help='name of the experiment', type=str)
     args = parser.parse_args()
     args.tied = not args.not_tied
+    for k, v in vars(args).items():
+        print(f'{k} = {v}')
 
     tokenizer = build_tokenizer()
-    # model_name = 'bigscience/bloom-petals'
-    model_name = 'bigscience/bloom-7b1-petals'
-    model = build_model(n_tokens=tokenizer.vocab_size + 1, pretrained_model_name_or_path=model_name, tied_weights=args.tied)  # vocab + pad
+    model_name = 'bigscience/bloom-petals'
+    if not args.big:
+        model_name = 'bigscience/bloom-7b1-petals'
+    model = build_model(n_tokens=tokenizer.vocab_size + 1, pretrained_model_name_or_path=model_name,
+                        tied_weights=args.tied)  # vocab + pad
 
     n_epochs = 300
     n_steps_per_epoch = 32
     batch_size = 32
-    max_length = 64
-    dataloader = build_data(tokenizer, batch_size=batch_size, max_length=max_length)
+    max_length = 32
+    num_workers = 16
+    tokenizer.model_max_length = max_length
+    dataloader = build_data(tokenizer, batch_size=batch_size, max_length=max_length, num_workers=num_workers)
+    print(f'''
+    BATCH_SIZE = {batch_size}
+    MAX_SEQ_LEN = {max_length}
+    NUM_WORKERS = {num_workers}
+    ''')
 
     device = 'cuda:0'
     learning_rate = 6e-5
+    # learning_rate = 3e-4
     min_lr = 6e-6
     beta_1 = 0.9
     beta_2 = 0.95
     weight_decay = 1e-1
 
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), betas=(beta_1, beta_2), eps=1e-8, lr=learning_rate, weight_decay=weight_decay)
-    # lr_scheduler = get_scheduler(name='linear', optimizer=optimizer, num_warmup_steps=n_steps_per_epoch * 10,
-    #                              num_training_steps=n_steps_per_epoch * n_epochs)
-    # lr_scheduler = CosineAnnealingWarmupRestarts(optimizer, first_cycle_steps=n_steps_per_epoch * n_epochs,
-    #                                              max_lr=learning_rate, min_lr=min_lr, warmup_steps=n_steps_per_epoch * 2)
+    optimizer = torch.optim.AdamW(model.parameters(), betas=(beta_1, beta_2), eps=1e-8, lr=learning_rate,
+                                  weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler()
 
     history = defaultdict(list)
@@ -144,7 +176,7 @@ def main():
     # batch['attention_mask'] = None
     # losses = []
     # perplexity_values = []
-    # for _ in tqdm(range(10_000)):
+    # for _ in tqdm(range(1_000)):
     #     cur_lr = optimizer.param_groups[0]['lr']
     #     with torch.autocast(device_type='cuda', dtype=torch.float16):
     #         outputs = model(**batch)
@@ -163,7 +195,7 @@ def main():
     #     scaler.step(optimizer)
     #     optimizer.zero_grad()
     #     scaler.update()
-    #     lr_scheduler.step()
+    #     # lr_scheduler.step()
     #
     #     losses.append(loss.item())
     #     perplexity_values.append(torch.exp(loss).item())
@@ -174,8 +206,7 @@ def main():
     # assert False
 
     start_epoch = 0
-    # exp_name = 'test_exp_petals_0'
-    exp_name = 'test_exp_petals_7B1_not_tied'
+    exp_name = args.exp_name
     savedir = os.path.join('train_results', exp_name)
     last_snapshot_name = os.path.join(savedir, 'last_snapshot.tar')
     if not args.resume:
@@ -199,7 +230,8 @@ def main():
         start_epoch = len(history['train_loss'])
         copyfile(last_snapshot_name, os.path.join(savedir, f'snapshot_epoch_{str(start_epoch).zfill(4)}.tar'))
 
-    lr_scheduler = CosineAnnealingWarmupRestarts(optimizer, first_cycle_steps=n_steps_per_epoch * (n_epochs - start_epoch),
+    lr_scheduler = CosineAnnealingWarmupRestarts(optimizer,
+                                                 first_cycle_steps=n_steps_per_epoch * (n_epochs - start_epoch),
                                                  max_lr=learning_rate, min_lr=min_lr,
                                                  warmup_steps=n_steps_per_epoch * 2)
     for epoch in tqdm(range(start_epoch, n_epochs)):
@@ -244,14 +276,16 @@ def main():
         history['lr'].extend(lrs)
 
         snapshot = {
-            'model': model.transformer.word_embeddings.state_dict(),
+            # 'model': model.transformer.word_embeddings.state_dict(),
+            'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'history': history
         }
-        if args.not_tied:
-            snapshot['lm_head'] = model.lm_head.state_dict()
+        # if args.not_tied:
+        #     snapshot['lm_head'] = model.lm_head.state_dict()
         path = last_snapshot_name
         torch.save(snapshot, path)
+
 
 if __name__ == '__main__':
     main()
